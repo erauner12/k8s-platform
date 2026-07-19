@@ -1,0 +1,663 @@
+name: 🧱 Validate Scaffold
+
+on:
+  pull_request:
+    branches: [main]
+  # The admissibility job consumes live policy mains, so it must keep checking
+  # even while this template has no unrelated pull-request activity. GitHub runs
+  # scheduled workflows from the latest default-branch commit.
+  schedule:
+    - cron: "17 6 * * 1"  # weekly, Monday 06:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+# Template-repo-only scaffold-integrity gate. The deploy/ Kustomize manifests are
+# this template's core deliverable — every new tenant inherits them — so a PR that
+# breaks the kustomization (a renamed/removed resource, a YAML error) must not
+# merge green and ship broken scaffolding downstream. Three layers run here:
+#   1. schema-validate the deploy/ manifests (a typo'd CRD field that renders
+#      without complaint must fail loudly), and
+#   2. exercise scripts/rename-placeholders.sh — the onboarding script every new
+#      tenant runs first; a botched sed address (a missed file, a corrupted label
+#      KEY, a double-renamed CNPG `-app` suffix) would otherwise ship broken to
+#      every tenant while the manifest validation above — which only ever sees the
+#      UNrenamed scaffold — stays green, and
+#   3. pin the agent-maintenance safety boundaries that every new tenant copies
+#      once and then owns outside template sync.
+# This job runs ONLY in the template repo; it no-ops in tenants created from it
+# (the guard below is false there), mirroring how cd.yaml/release.yaml run only in
+# tenants. Tenants replace deploy/ with their own app and validate it via their
+# own ci.yaml.
+jobs:
+  validate-scaffold:
+    name: Validate Scaffold
+    if: github.repository == 'devantler-tech/gitops-tenant-template'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+    env:
+      KUBECONFORM_VERSION: v0.7.0
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+      # Pin the datreeio CRDs-catalog to a commit so validation is deterministic.
+      # Bumping this ref is the refresh mechanism — a small, visible, reviewed
+      # one-line change. We deliberately do NOT vendor the schemas in-repo: a
+      # megabyte of copied JSON has no natural owner and drifts silently from
+      # upstream, which is worse than the transient network dependency the cache
+      # below already neutralises for the steady state.
+      CRDS_CATALOG_REF: 1f22207301c45da9ee687f6bbf728da049e6c105
+    steps:
+      - name: 🔒 Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: 📥 Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false # read-only job; never pushes, so don't keep the token
+      - name: 🧪 Validate drift-gate contract
+        id: validate-drift-gate-contract
+        run: |
+          set -eu
+          workflow=.github/workflows/validate-scaffold.yaml
+          expected_if=$(
+            printf '%s' \
+              "github.repository == 'devantler-tech/gitops-tenant-template'"
+          )
+          export expected_if
+          assert_yaml() {
+            description=$1
+            expression=$2
+            if ! yq eval -e "${expression}" "${workflow}" >/dev/null; then
+              echo "::error::drift-gate contract: ${description}"
+              exit 1
+            fi
+          }
+
+          secretstore_contract='
+            .jobs.admissibility.steps
+            | map(select(
+                .id == "apply-admission-policies"
+                and ((.run | split("restrict-tenant-secret-stores") | length) == 9)
+                and ((.run | split("externalsecret-no-clustersecretstore") | length) == 3)
+                and ((.run | split("app.kubernetes.io/managed-by") | length) == 3)
+                and ((.run | split("--values-file tenant-values.yaml") | length) == 4)
+                and ((.run | split("--userinfo tenant-user-info.yaml") | length) == 4)
+                and ((.run | split("unmanaged-values.yaml") | length) == 3)
+                and ((.run | split("platform-user-info.yaml") | length) == 3)
+                and ((.run | split("ClusterSecretStore") | length) == 3)
+                and ((.run | split("expect_secretstore_denied") | length) == 3)
+                and ((.run | split("expect_secretstore_allowed") | length) == 5)
+              ))
+            | length == 1
+          '
+
+          assert_secretstore_mutant_rejected() {
+            description=$1
+            mutation=$2
+            mutant=$(mktemp)
+            yq eval "${mutation}" "${workflow}" > "${mutant}"
+            if yq eval -e "${secretstore_contract}" "${mutant}" >/dev/null 2>&1; then
+              echo "::error::SecretStore contract accepted mutant: ${description}"
+              rm -f "${mutant}"
+              exit 1
+            fi
+            rm -f "${mutant}"
+          }
+
+          assert_yaml "pull requests to main must stay covered" \
+            '.["on"].pull_request.branches | (length == 1 and .[0] == "main")'
+          assert_yaml "the live-policy drift gate must run weekly" \
+            '.["on"].schedule | (length == 1 and .[0].cron == "17 6 * * 1")'
+          assert_yaml "manual dispatch must stay covered" \
+            '.["on"] | has("workflow_dispatch")'
+          assert_yaml "the contract job must cover every event" \
+            '.jobs."validate-scaffold".if == strenv(expected_if)'
+          assert_yaml "the contract job must have no dependencies" \
+            '.jobs."validate-scaffold".needs == null'
+          assert_yaml "the contract job must fail closed" \
+            '.jobs."validate-scaffold" | has("continue-on-error") | not'
+          assert_yaml "the contract step must run and fail closed" '
+            .jobs."validate-scaffold".steps
+            | map(select(.id == "validate-drift-gate-contract"))
+            | map(select(
+                (has("if") or has("continue-on-error")) | not
+              ))
+            | length == 1
+          '
+          assert_yaml "all events must reach admissibility" \
+            '.jobs.admissibility.if == strenv(expected_if)'
+          assert_yaml "admissibility must have no dependencies" \
+            '.jobs.admissibility.needs == null'
+          assert_yaml "admissibility steps must be unconditional" '
+            .jobs.admissibility.steps
+            | map(select(has("if")))
+            | length == 0
+          '
+          assert_yaml "admissibility steps must propagate errors" '
+            .jobs.admissibility.steps
+            | map(select(has("continue-on-error")))
+            | length == 0
+          '
+          assert_yaml "Kyverno evaluation must stay in the job" '
+            .jobs.admissibility.steps
+            | map(select(
+                .id == "apply-admission-policies"
+                and (.run | test(
+                  "(?m)^[[:space:]]*\\./kyverno apply[[:space:]]"
+                ))
+                and (.run | test(
+                  "(?m)^[[:space:]]*check_set platform " +
+                  "\\.platform/k8s/bases/infrastructure/" +
+                  "cluster-policies true[[:space:]]*$"
+                ))
+                and (.run | test(
+                  "(?m)^[[:space:]]*check_set shared " +
+                  "\\.shared-policies false[[:space:]]*$"
+                ))
+              ))
+            | length == 1
+          '
+          assert_yaml "admissibility must fail closed" \
+            '.jobs.admissibility | has("continue-on-error") | not'
+          assert_yaml "tenant SecretStore admission must stay context- and mutation-proved" \
+            "${secretstore_contract}"
+
+          admission_run='(.jobs.admissibility.steps[] | select(
+            .id == "apply-admission-policies"
+          ).run)'
+          assert_secretstore_mutant_rejected "managed namespace context removed" \
+            "${admission_run} |= sub(\"app.kubernetes.io/managed-by\"; \"removed-label\")"
+          assert_secretstore_mutant_rejected "tenant values flag removed" \
+            "${admission_run} |= sub(\"--values-file tenant-values.yaml\"; \"\")"
+          assert_secretstore_mutant_rejected "tenant user info removed" \
+            "${admission_run} |= sub(\"--userinfo tenant-user-info.yaml\"; \"\")"
+          assert_secretstore_mutant_rejected "named policy removed" \
+            "${admission_run} |= sub(\"restrict-tenant-secret-stores\"; \"\")"
+          assert_secretstore_mutant_rejected "named rule removed" \
+            "${admission_run} |= sub(\"externalsecret-no-clustersecretstore\"; \"\")"
+          assert_secretstore_mutant_rejected "security mutation removed" \
+            "${admission_run} |= sub(\"ClusterSecretStore\"; \"\")"
+          assert_secretstore_mutant_rejected "denial assertion removed" \
+            "${admission_run} |= sub(\"expect_secretstore_denied\"; \"\")"
+          assert_secretstore_mutant_rejected "boundary controls removed" \
+            "${admission_run} |= (sub(\"unmanaged-values.yaml\"; \"\") | sub(\"platform-user-info.yaml\"; \"\"))"
+      - name: ♻️ Cache CRD schemas
+        # Persist the schemas kubeconform downloads from the catalog, keyed on the
+        # pinned ref. A cache hit makes the validate step network-free (no fetch at
+        # all), so a raw.githubusercontent.com blip can't flake the gate in steady
+        # state; only a cold cache or a ref bump re-fetches.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .kubeconform-cache
+          key: kubeconform-crds-${{ env.CRDS_CATALOG_REF }}
+      - name: 🧱 Build & schema-validate deploy/ manifests
+        # kubectl (with embedded kustomize) is preinstalled on ubuntu-latest. Render
+        # the manifests (a broken kustomization fails the render, not silently
+        # downstream), then schema-validate every rendered resource with kubeconform —
+        # the devantler-tech-standard manifest validator (KSail embeds it; the
+        # platform's gitops-repo-audit skill uses it). Standard Kubernetes kinds
+        # validate against kubeconform's built-in default schemas; the CRD-backed
+        # resources (ExternalSecret, SecretStore, CloudNativePG Cluster, Gateway-API
+        # HTTPRoute) validate against the datreeio CRDs-catalog, pinned + cached above.
+        # NOTE: there is intentionally NO `-ignore-missing-schemas` — a CRD whose
+        # schema doesn't resolve fails the gate loudly rather than being silently
+        # skipped (which would pass green while validating nothing). The explicit
+        # `Skipped: 0` assertion below enforces that invariant. Adding a CRD to deploy/
+        # therefore requires the pinned catalog to carry its schema. This catches a
+        # typo'd field that `kubectl kustomize` renders without complaint before it
+        # ships to tenants.
+        run: |
+          set -euo pipefail
+          mkdir -p .kubeconform-cache
+          # Download + checksum-verify the kubeconform binary (supply-chain integrity).
+          curl -fsSL --retry 3 --retry-all-errors -o kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum -c -
+          tar -xzf kubeconform.tar.gz kubeconform
+          # Render first (broken kustomization fails here), then schema-validate.
+          kubectl kustomize deploy/ > rendered.yaml
+          # Short retry absorbs a transient catalog blip while (re)populating the cache;
+          # a cache hit needs no network and succeeds on the first attempt. Fold stderr
+          # into the capture (2>&1) so the Skipped:0 assertion below reads kubeconform's
+          # summary regardless of which stream a future version prints it on.
+          ok=
+          for attempt in 1 2 3; do
+            if ./kubeconform \
+                -strict -summary -verbose \
+                -cache .kubeconform-cache \
+                -schema-location default \
+                -schema-location "https://raw.githubusercontent.com/datreeio/CRDs-catalog/${CRDS_CATALOG_REF}/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" \
+                rendered.yaml 2>&1 | tee kubeconform.out; then
+              ok=1
+              break
+            fi
+            echo "kubeconform attempt ${attempt} failed; retrying in 5s..."
+            sleep 5
+          done
+          [ -n "${ok}" ] || { echo "::error::kubeconform failed after 3 attempts"; exit 1; }
+          # Guardrail: never pass green while validating nothing. Without
+          # -ignore-missing-schemas an unresolved schema already errors above; this
+          # asserts it explicitly so the invariant holds even if the flag is re-added.
+          grep -Eq 'Skipped: 0$' kubeconform.out || {
+            echo "::error::a resource was skipped — its CRD schema did not resolve; pin a catalog ref that carries it or fix the kind"
+            exit 1
+          }
+      - name: 🧱 Validate onboarding (rename-placeholders.sh)
+        # Run the onboarding script end-to-end against a throwaway copy and assert
+        # the rename is correct (the build step above only ever sees the UNrenamed
+        # scaffold, so this is the only thing that catches a botched rename before
+        # it ships to every tenant). kubectl is preinstalled, so the test's
+        # post-rename `kubectl kustomize` build assertion runs here too.
+        run: sh scripts/rename-placeholders.test.sh
+      - name: 🤖 Validate scaffolded agent instructions
+        # These files become tenant-owned immediately after creation, so a stale
+        # trust or promotion rule cannot be repaired by template sync later.
+        run: sh scripts/agent-instructions.test.sh
+
+  # Platform admissibility gate (#71, epic #6 theme 4): the scaffold's promise is
+  # "admissible on day one", so apply the platform's LIVE Kyverno admission policy
+  # set (plus the shared kyverno-policies set) to the rendered scaffold and fail on
+  # Enforce-mode violations. The policy checkouts are deliberately UNPINNED (main):
+  # this gate exists to track the live admission truth — drift IS the signal — the
+  # mirror of the schema job's pinned-catalog rationale, where determinism wins.
+  # Scope notes: PodSecurity (namespace-label PSA) is not checkable offline and is
+  # out of scope here; generate rules and mutate-existing rules are filtered out —
+  # they act on cluster state, require a live client, and never reject an applied
+  # manifest.
+  #
+  # Only `ClusterPolicy` resources are applied. The platform also ships CEL
+  # `ImageValidatingPolicy` resources (`verify-app-images`, `verify-ksail-images`),
+  # and `verify-app-images` IS Deny-mode over every `ghcr.io/devantler-tech/*`
+  # tenant image — so this gate deliberately does not cover the one policy class
+  # that can reject a tenant pod on image provenance. That is a scope boundary,
+  # not an oversight: those policies check cosign signatures and attestations on a
+  # published digest, which needs registry access and a real signed image. The
+  # scaffold's placeholder tag is neither, so applying them here could only ever
+  # produce a false failure. Tenant images earn their signature at publish time —
+  # `cd.yaml` calls the shared `publish-app.yaml`, whose keyless signing identity
+  # is what `verify-app-images` accepts — so provenance is enforced in CD and at
+  # admission, just not in this offline gate.
+  admissibility:
+    name: Platform Admissibility
+    if: github.repository == 'devantler-tech/gitops-tenant-template'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkouts
+    env:
+      KYVERNO_CLI_VERSION: v1.18.2
+      KYVERNO_CLI_SHA256: cb2feb8356149fd2fe774c894ccf0969f4a60a83867dd913af724f74ffbbc18b
+    steps:
+      - name: 🔒 Harden runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+      - name: 📥 Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: 📥 Checkout platform policies (live main — drift is the signal)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: devantler-tech/platform
+          path: .platform
+          sparse-checkout: k8s/bases/infrastructure/cluster-policies
+          persist-credentials: false
+      - name: 📥 Checkout shared kyverno-policies (live main)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: devantler-tech/kyverno-policies
+          path: .shared-policies
+          persist-credentials: false
+      - name: 🛂 Apply admission policies to the rendered scaffold
+        id: apply-admission-policies
+        run: |
+          set -euo pipefail
+          # Download + checksum-verify the kyverno CLI (supply-chain integrity).
+          curl -fsSL --retry 3 --retry-all-errors -o kyverno.tar.gz \
+            "https://github.com/kyverno/kyverno/releases/download/${KYVERNO_CLI_VERSION}/kyverno-cli_${KYVERNO_CLI_VERSION}_linux_x86_64.tar.gz"
+          echo "${KYVERNO_CLI_SHA256}  kyverno.tar.gz" | sha256sum -c -
+          tar -xzf kyverno.tar.gz kyverno
+
+          kubectl kustomize deploy/ > rendered.yaml
+
+          # Keep only ClusterPolicies, and only their admission-relevant rules
+          # (drop generate + mutate-existing rules; see the job comment). Plain
+          # mutate rules are KEPT deliberately: the CLI applies them before
+          # validating, mirroring the cluster's mutate-then-validate admission
+          # order — validating the raw scaffold instead would false-fail rules
+          # that an admission mutation satisfies.
+          filter_admission_rules() {
+            yq eval-all '
+              select(.kind == "ClusterPolicy")
+              | .spec.rules |= map(select(
+                  (has("generate") or (has("mutate") and (.mutate | has("targets")))) | not
+                ))
+              | select((.spec.rules | length) > 0)
+            ' "$1"
+          }
+
+          # check_set <name> <kustomize-dir> <require_pass>
+          # require_pass=true adds the fail-open guard: at least one rule must
+          # actually PASS a resource, proving the gate evaluated something (a
+          # broken render/filter otherwise passes green while validating nothing).
+          # The shared set legitimately matches nothing today (its policies
+          # target HelmReleases), so the guard applies to the platform set only.
+          check_set() {
+            name=$1 dir=$2 require_pass=$3
+            kubectl kustomize "$dir" > "${name}-policies.yaml"
+            filter_admission_rules "${name}-policies.yaml" > "${name}-admission.yaml"
+            if ! grep -q '^kind: ClusterPolicy' "${name}-admission.yaml"; then
+              echo "::notice::${name}: no admission-relevant ClusterPolicies to apply"
+              return 0
+            fi
+            # --audit-warn: Audit-mode policies warn (they don't block admission);
+            # --warn-exit-code 0 activates exit-1-on-failure/error while keeping
+            # warnings non-fatal — verified against kyverno CLI v1.18.2.
+            ./kyverno apply "${name}-admission.yaml" --resource rendered.yaml \
+              --audit-warn --warn-exit-code 0 2>&1 | tee "${name}-apply.out"
+            if [ "${require_pass}" = "true" ]; then
+              grep -Eq 'pass: [1-9]' "${name}-apply.out" || {
+                echo "::error::${name}: no rule passed any resource — the gate evaluated nothing; fix the render/filter rather than trusting a vacuous green"
+                return 1
+              }
+            fi
+          }
+
+          check_set platform .platform/k8s/bases/infrastructure/cluster-policies true
+          check_set shared .shared-policies false
+
+          # The aggregate check above proves the platform policy set evaluated
+          # something, but tenant-scoped policies also need admission context.
+          # Isolate the exact high-severity rule so unrelated policy passes can
+          # never mask a skipped SecretStore boundary.
+          yq eval-all '
+            select(
+              .kind == "ClusterPolicy"
+              and .metadata.name == "restrict-tenant-secret-stores"
+            )
+          ' platform-policies.yaml > restrict-tenant-secret-stores.yaml
+          policy_count=$(grep -c '^kind: ClusterPolicy$' restrict-tenant-secret-stores.yaml)
+          [ "${policy_count}" -eq 1 ] || {
+            echo "::error::expected exactly one restrict-tenant-secret-stores policy, found ${policy_count}"
+            exit 1
+          }
+          yq eval -e '
+            [.spec.rules[].name
+              | select(. == "externalsecret-no-clustersecretstore")]
+            | length == 1
+          ' restrict-tenant-secret-stores.yaml >/dev/null || {
+            echo "::error::restrict-tenant-secret-stores is missing its ExternalSecret rule"
+            exit 1
+          }
+
+          # Model the context Flux supplies when reconciling a tenant artifact:
+          # a concrete namespace selected as KSail-managed, plus that tenant's
+          # impersonated reconciliation ServiceAccount.
+          yq eval '
+            select(.kind == "ExternalSecret")
+            | .metadata.namespace = "tenant-admission-test"
+          ' rendered.yaml > tenant-external-secret.yaml
+          resource_count=$(grep -c '^kind: ExternalSecret$' tenant-external-secret.yaml)
+          [ "${resource_count}" -eq 1 ] || {
+            echo "::error::expected exactly one rendered ExternalSecret, found ${resource_count}"
+            exit 1
+          }
+          yq eval -e '.spec.secretStoreRef.kind == "SecretStore"' \
+            tenant-external-secret.yaml >/dev/null || {
+            echo "::error::the valid scaffold no longer references its namespaced SecretStore"
+            exit 1
+          }
+          yq eval '.spec.secretStoreRef.kind = "ClusterSecretStore"' \
+            tenant-external-secret.yaml > tenant-clustersecretstore.yaml
+
+          yq -n '
+            .apiVersion = "cli.kyverno.io/v1alpha1"
+            | .kind = "Values"
+            | .metadata.name = "tenant-admission"
+            | .namespaceSelector = [{
+                "name": "tenant-admission-test",
+                "labels": {"app.kubernetes.io/managed-by": "ksail"}
+              }]
+          ' > tenant-values.yaml
+          yq -n '
+            .apiVersion = "cli.kyverno.io/v1alpha1"
+            | .kind = "Values"
+            | .metadata.name = "unmanaged-admission"
+            | .namespaceSelector = [{
+                "name": "tenant-admission-test",
+                "labels": {"app.kubernetes.io/managed-by": "manual"}
+              }]
+          ' > unmanaged-values.yaml
+          yq -n '
+            .apiVersion = "cli.kyverno.io/v1alpha1"
+            | .kind = "UserInfo"
+            | .metadata.name = "tenant-reconciler"
+            | .userInfo.username =
+                "system:serviceaccount:tenant-admission-test:tenant-admission-test"
+          ' > tenant-user-info.yaml
+          yq -n '
+            .apiVersion = "cli.kyverno.io/v1alpha1"
+            | .kind = "UserInfo"
+            | .metadata.name = "platform-reconciler"
+            | .userInfo.username =
+                "system:serviceaccount:flux-system:kustomize-controller"
+          ' > platform-user-info.yaml
+
+          run_secretstore_case() {
+            case_name=$1
+            resource=$2
+            shift 2
+            ./kyverno apply restrict-tenant-secret-stores.yaml \
+              --resource "${resource}" "$@" \
+              --audit-warn --warn-exit-code 0 \
+              > "${case_name}.out" 2>&1
+          }
+
+          expect_secretstore_allowed() {
+            case_name=$1 expected=$2 resource=$3
+            shift 3
+            if ! run_secretstore_case "${case_name}" "${resource}" "$@"; then
+              cat "${case_name}.out"
+              echo "::error::${case_name}: expected the SecretStore boundary to allow this request"
+              return 1
+            fi
+            case "${expected}" in
+              pass) result='pass: [1-9][0-9]*, fail: 0, warn: 0, error: 0' ;;
+              no-match) result='pass: 0, fail: 0, warn: 0, error: 0, skip: 0' ;;
+              *) echo "::error::unknown expected result: ${expected}"; return 1 ;;
+            esac
+            grep -Eq "${result}" "${case_name}.out" || {
+              cat "${case_name}.out"
+              echo "::error::${case_name}: Kyverno returned a vacuous or unexpected success"
+              return 1
+            }
+          }
+
+          expect_secretstore_denied() {
+            case_name=$1 resource=$2
+            shift 2
+            if run_secretstore_case "${case_name}" "${resource}" "$@"; then
+              cat "${case_name}.out"
+              echo "::error::${case_name}: ClusterSecretStore mutation was accepted"
+              return 1
+            fi
+            if ! grep -Fq 'policy restrict-tenant-secret-stores' \
+                "${case_name}.out" ||
+              ! grep -Fq 'externalsecret-no-clustersecretstore' \
+                "${case_name}.out" ||
+              ! grep -Eq 'pass: 0, fail: [1-9][0-9]*, warn: 0, error: 0' \
+                "${case_name}.out"; then
+              cat "${case_name}.out"
+              echo "::error::${case_name}: failure did not come from the expected policy and rule"
+              return 1
+            fi
+          }
+
+          expect_secretstore_allowed tenant-valid pass \
+            tenant-external-secret.yaml \
+            --values-file tenant-values.yaml \
+            --userinfo tenant-user-info.yaml
+          expect_secretstore_denied tenant-mutant \
+            tenant-clustersecretstore.yaml \
+            --values-file tenant-values.yaml \
+            --userinfo tenant-user-info.yaml
+          expect_secretstore_allowed unmanaged-mutant no-match \
+            tenant-clustersecretstore.yaml \
+            --values-file unmanaged-values.yaml \
+            --userinfo tenant-user-info.yaml
+          expect_secretstore_allowed platform-mutant no-match \
+            tenant-clustersecretstore.yaml \
+            --values-file tenant-values.yaml \
+            --userinfo platform-user-info.yaml
+      - name: 🔗 Assert the spread-pods lockstep
+        id: assert-spread-lockstep
+        # The platform's `spread-pods` policy injects its topology spread
+        # constraint through Kyverno's ADD-IF-NOT-PRESENT anchor
+        # (`+(topologySpreadConstraints)`). Because the scaffold authors its own
+        # constraint, that mutation never fires — the scaffold's block is what
+        # actually runs, and any guard the platform adds to its version (notably
+        # `matchLabelKeys: [pod-template-hash]`, which stops a rolling update
+        # deadlocking under `DoNotSchedule`) is silently NOT inherited.
+        #
+        # So assert the two agree, reading the expectation from the platform's
+        # live policy rather than a copy: if the platform changes its remedy,
+        # this goes red and the scaffold gets updated. Same philosophy as the
+        # rest of this job — drift IS the signal.
+        run: |
+          set -euo pipefail
+
+          kubectl kustomize deploy/ > rendered.yaml
+          kubectl kustomize .platform/k8s/bases/infrastructure/cluster-policies \
+            > spread-policies.yaml
+
+          # Compare the WHOLE constraint LIST, not one element and not a field
+          # allowlist. Indexing `[0]` would let the platform add a second
+          # constraint (say, a zone spread) that the scaffold never inherits
+          # while this stayed green; an allowlist silently drops any field it
+          # doesn't name, so the day the platform adds `minDomains`,
+          # `nodeAffinityPolicy` or `nodeTaintsPolicy` the gate would stay green
+          # while the scaffold diverged. Both are the exact drift this gate
+          # exists to catch. `labelSelector` is the ONE field held out here —
+          # the platform templates it from the admission request
+          # (matchExpressions over a Kyverno variable) while the scaffold
+          # hard-codes the same app via matchLabels, so comparing them literally
+          # would be permanent false drift — and it is asserted separately
+          # below rather than discarded. `sort_keys` makes the comparison
+          # independent of authoring order on either side.
+          normalise='del(.[].labelSelector) | sort_keys(..)'
+
+          expected=$(yq eval-all "
+            select(.kind == \"ClusterPolicy\" and .metadata.name == \"spread-pods\")
+            | .spec.rules[0].mutate.patchStrategicMerge.spec.template.spec.\"+(topologySpreadConstraints)\"
+            | ${normalise}
+          " spread-policies.yaml)
+
+          actual=$(yq eval-all "
+            select(.kind == \"Deployment\")
+            | .spec.template.spec.topologySpreadConstraints
+            | ${normalise}
+          " rendered.yaml)
+
+          # Fail closed on a read that found nothing: an empty document, a bare
+          # `null`, or an empty list means the policy was renamed, the anchor
+          # changed, or the block was deleted outright — none of which may pass
+          # green. A read that found constraints but DIFFERENT ones falls
+          # through to the diff below, which shows both sides.
+          for pair in "platform:${expected}" "scaffold:${actual}"; do
+            side=${pair%%:*}
+            doc=${pair#*:}
+            if [ -z "${doc}" ] || [ "${doc}" = "null" ] || [ "${doc}" = "[]" ]; then
+              echo "::error::${side}: found no topology spread constraint at all — the policy or the scaffold moved; fix the reader rather than trusting a vacuous green"
+              printf '%s\n' "${doc}"
+              exit 1
+            fi
+          done
+
+          if [ "${expected}" != "${actual}" ]; then
+            echo "::error::the scaffold's topologySpreadConstraints no longer matches what the platform's spread-pods policy would inject"
+            echo "--- platform (spread-pods) ---"
+            printf '%s\n' "${expected}"
+            echo "--- scaffold (deploy/deployment.yaml) ---"
+            printf '%s\n' "${actual}"
+            exit 1
+          fi
+
+          # The selectors are held out above because they are SPELLED
+          # differently, not because they are unimportant: the selector decides
+          # which pods count toward the skew, so a platform change there
+          # silently changes the scaffold's scheduling guarantee. Rather than
+          # canonicalising two shapes into one — which re-introduces the same
+          # blindness the moment a shape gains a field — pin each side to the
+          # exact form that was hand-verified equivalent: the platform selects
+          # `app.kubernetes.io/name In [<the admitted object's own name>]`, the
+          # scaffold selects `app.kubernetes.io/name = <its own name>`. Same
+          # selection, different spelling. If EITHER shape changes at all — a
+          # second matchExpression, a different key, a broadened operator —
+          # this goes red and a human re-derives the equivalence instead of a
+          # script guessing at it.
+          platform_selectors=$(yq eval-all "
+            select(.kind == \"ClusterPolicy\" and .metadata.name == \"spread-pods\")
+            | [ .spec.rules[0].mutate.patchStrategicMerge.spec.template.spec.\"+(topologySpreadConstraints)\"[].labelSelector ]
+            | sort_keys(..)
+          " spread-policies.yaml)
+
+          expected_platform_selectors=$(yq eval 'sort_keys(..)' - <<'PLATFORM_SELECTOR'
+          - matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - '{{request.object.spec.template.metadata.labels."app.kubernetes.io/name"}}'
+          PLATFORM_SELECTOR
+          )
+
+          if [ "${platform_selectors}" != "${expected_platform_selectors}" ]; then
+            echo "::error::the platform's spread-pods labelSelector is no longer the shape this scaffold was verified equivalent to — re-derive the equivalence and update both sides"
+            echo "--- platform (spread-pods) ---"
+            printf '%s\n' "${platform_selectors}"
+            echo "--- verified-equivalent shape ---"
+            printf '%s\n' "${expected_platform_selectors}"
+            exit 1
+          fi
+
+          # Asserting the scaffold's selector against the Deployment's OWN app
+          # name — rather than a hardcoded string — is what makes it the same
+          # statement as the platform's request-derived variable. `strenv`
+          # interpolates the name without it ever being YAML text, so a value
+          # needing quoting cannot change the document's shape.
+          scaffold_app=$(yq eval-all '
+            select(.kind == "Deployment")
+            | .spec.template.metadata.labels."app.kubernetes.io/name"
+          ' rendered.yaml)
+
+          if [ -z "${scaffold_app}" ] || [ "${scaffold_app}" = "null" ]; then
+            echo "::error::scaffold: the Deployment has no app.kubernetes.io/name template label, so its spread selector cannot be checked against its own identity"
+            exit 1
+          fi
+
+          scaffold_selectors=$(yq eval-all "
+            select(.kind == \"Deployment\")
+            | [ .spec.template.spec.topologySpreadConstraints[].labelSelector ]
+            | sort_keys(..)
+          " rendered.yaml)
+
+          expected_scaffold_selectors=$(SCAFFOLD_APP="${scaffold_app}" yq eval '
+            .[0].matchLabels."app.kubernetes.io/name" = strenv(SCAFFOLD_APP) | sort_keys(..)
+          ' - <<'SCAFFOLD_SELECTOR'
+          - matchLabels:
+              app.kubernetes.io/name: PLACEHOLDER
+          SCAFFOLD_SELECTOR
+          )
+
+          if [ "${scaffold_selectors}" != "${expected_scaffold_selectors}" ]; then
+            echo "::error::the scaffold's spread labelSelector no longer selects exactly its own app, so it no longer matches the platform's request-derived selection"
+            echo "--- scaffold ---"
+            printf '%s\n' "${scaffold_selectors}"
+            echo "--- expected (selects its own app.kubernetes.io/name) ---"
+            printf '%s\n' "${expected_scaffold_selectors}"
+            exit 1
+          fi
+
+          echo "spread-pods lockstep OK:"
+          printf '%s\n' "${actual}"
+          echo "selectors verified equivalent (platform request-derived In; scaffold matchLabels ${scaffold_app})"
