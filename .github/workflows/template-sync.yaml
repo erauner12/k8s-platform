@@ -20,7 +20,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: devantler-tech/actions/.github/workflows/template-sync.yaml@47f0d9b632581a613963a2d25c243713f24c32a0 # v10.1.0
+    uses: devantler-tech/actions/.github/workflows/template-sync.yaml@1c252c8582292ecc6a5f194dcb29095149266044 # v13.0.8
     with:
       source-repo-path: devantler-tech/gitops-tenant-template
     secrets:
