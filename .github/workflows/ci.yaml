@@ -27,6 +27,6 @@ jobs:
     if: ${{ always() }}
     steps:
       - name: 📊 Require all CI checks to pass
-        uses: devantler-tech/actions/aggregate-job-checks@47f0d9b632581a613963a2d25c243713f24c32a0 # v10.1.0
+        uses: devantler-tech/actions/aggregate-job-checks@4445e2b5f3d7c5130f04a9640654b71e6fadd1b5 # v13.1.2
         with:
           job-results: ${{ needs.example.result }}
